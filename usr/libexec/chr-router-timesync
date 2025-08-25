@@ -102,23 +102,17 @@ def main():
     """
     Main routine: synchronize host time with CHR Router's time.
     """
-    # Connect to libvirt and locate the VM
     conn = libvirt.open("qemu:///system")
-    if conn is None:
-        raise RuntimeError("Failed to open libvirt connection to qemu:///system.")
-    domain = conn.lookupByName(CHR_VM_NAME)
-    if domain is None:
+    try:
+        domain = conn.lookupByName(CHR_VM_NAME)
+        gmt_offset = int(get_router_clock_field(domain, "gmt-offset"))
+        tzinfo = datetime.timezone(datetime.timedelta(seconds=gmt_offset))
+        router_date = datetime.date.fromisoformat(get_router_clock_field(domain, "date"))
+        router_time = datetime.time.fromisoformat(get_router_clock_field(domain, "time"))
+        router_datetime = datetime.datetime.combine(router_date, router_time, tzinfo=tzinfo)
+        set_host_system_time_utc(router_datetime)
+    finally:
         conn.close()
-        raise RuntimeError(f"Failed to find domain '{CHR_VM_NAME}'.")
-
-    # Retrieve router's time info via QEMU agent
-    gmt_offset = int(get_router_clock_field(domain, "gmt-offset"))
-    tzinfo = datetime.timezone(datetime.timedelta(seconds=gmt_offset))
-    router_date = datetime.date.fromisoformat(get_router_clock_field(domain, "date"))
-    router_time = datetime.time.fromisoformat(get_router_clock_field(domain, "time"))
-    router_datetime = datetime.datetime.combine(router_date, router_time, tzinfo=tzinfo)
-    set_host_system_time_utc(router_datetime)
-    conn.close()
 
 
 if __name__ == "__main__":
