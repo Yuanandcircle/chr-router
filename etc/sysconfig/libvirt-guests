@@ -1,0 +1,3 @@
+# Configuration for libvirt-guests service
+ON_SHUTDOWN=shutdown
+SHUTDOWN_TIMEOUT=120

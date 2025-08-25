@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""CHR Router Libvirt Domain Generator.
+
+Generates and imports a libvirt domain XML for a CHR Router VM,
+prepares the VM disk, configures network bridges using NetworkManager via D-Bus,
+and starts a specified systemd unit via D-Bus.
+"""
+
+import dbus
+import libvirt
+import os
+import shutil
+import subprocess
+import uuid
+from typing import List
+
+CHR_VM_NAME = "routeros"
+CHR_IMAGE_SRC = "/usr/share/chr-router/routeros.img"
+CHR_IMAGE_DEST = "/var/lib/libvirt/images/routeros.qcow2"
+MIN_DISK_BYTES = 1024 ** 3
+RESERVED_DISK_BYTES = 4 * 1024 ** 3
+MIN_MEMORY_KB = 256 * 1024
+RESERVED_MEMORY_KB = 1024 * 1024
+POST_SYSTEMD_UNIT = "chr-router-destroy-onshutdown.service"
+
+
+def create_vm_disk(image_src: str, image_dest: str) -> str:
+    """Convert and resize the VM disk image using qemu-img.
+
+    Args:
+        image_src (str): Source disk image path.
+        image_dest (str): Destination disk image path.
+
+    Returns:
+        str: Path to the generated VM disk image.
+    """
+    if os.path.exists(image_dest):
+        os.remove(image_dest)
+    subprocess.run(
+        ["qemu-img", "convert", "-f", "raw", image_src, "-O", "qcow2", image_dest],
+        check=True,
+    )
+    disk_bytes = max(shutil.disk_usage("/sysroot").free - RESERVED_DISK_BYTES, MIN_DISK_BYTES)
+    subprocess.run(["qemu-img", "resize", image_dest, str(disk_bytes)], check=True)
+    return image_dest
+
+
+def configure_network_bridges() -> List[str]:
+    """Delete old bridges and create new ones for each ethernet device via NetworkManager D-Bus API.
+
+    Returns:
+        List[str]: List of created bridge names.
+    """
+    bus = dbus.SystemBus()
+    nm = dbus.Interface(
+        bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager"),
+        "org.freedesktop.NetworkManager",
+    )
+    nm_settings = dbus.Interface(
+        bus.get_object("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/Settings"),
+        "org.freedesktop.NetworkManager.Settings",
+    )
+
+    # Remove existing bridge and ethernet connections
+    for conn_path in nm_settings.ListConnections():
+        conn_obj = bus.get_object("org.freedesktop.NetworkManager", conn_path)
+        conn_iface = dbus.Interface(conn_obj, "org.freedesktop.NetworkManager.Settings.Connection")
+        conn_settings = conn_iface.GetSettings()
+        conn_type = conn_settings["connection"]["type"]
+        if conn_type in ("802-3-ethernet", "bridge"):
+            conn_iface.Delete()
+
+    # Create bridges for all ethernet devices
+    bridge_names: List[str] = []
+    bridge_index = 0
+    for dev_path in nm.GetDevices():
+        dev_obj = bus.get_object("org.freedesktop.NetworkManager", dev_path)
+        dev_props = dbus.Interface(dev_obj, "org.freedesktop.DBus.Properties")
+        dev_type = dev_props.Get("org.freedesktop.NetworkManager.Device", "DeviceType")
+        dev_iface = dev_props.Get("org.freedesktop.NetworkManager.Device", "Interface")
+        # DeviceType 1 refers to ethernet
+        if dev_type == 1:
+            bridge_name = f"vmbr{bridge_index}"
+            # Add bridge connection
+            bridge_conn = {
+                "connection": {
+                    "id": bridge_name,
+                    "type": "bridge",
+                    "interface-name": bridge_name,
+                    "autoconnect": True,
+                },
+                "bridge": {
+                    "stp": False,
+                },
+                "ipv4": {
+                    "method": "disabled",
+                },
+                "ipv6": {
+                    "method": "disabled",
+                },
+            }
+            nm_settings.AddConnection(bridge_conn)
+            # Add bridge-slave connection
+            slave_conn = {
+                "connection": {
+                    "id": f"{dev_iface}-slave",
+                    "type": "802-3-ethernet",
+                    "interface-name": dev_iface,
+                    "master": bridge_name,
+                    "slave-type": "bridge", 
+                    "autoconnect": True,
+                }
+            }
+            nm_settings.AddConnection(slave_conn)
+            bridge_names.append(bridge_name)
+            bridge_index += 1
+
+    return bridge_names
+
+
+def build_domain_xml(
+    vcpus: int,
+    memory_kb: int,
+    disk_path: str,
+    bridge_names: List[str],
+    domain_uuid: str,
+    domain_name: str,
+) -> str:
+    """Build the libvirt domain XML configuration.
+
+    Args:
+        vcpus (int): Number of vCPUs.
+        memory_kb (int): Memory size in KB.
+        disk_path (str): Path to disk image.
+        bridge_names (List[str]): List of bridge names.
+        domain_uuid (str): Domain UUID.
+        domain_name (str): Domain name.
+
+    Returns:
+        str: Domain XML string.
+    """
+    interface_blocks = "".join(
+        f"""
+        <interface type='bridge'>
+            <source bridge='{bridge}'/>
+            <model type='virtio'/>
+            <driver queues='{vcpus}'/>
+        </interface>"""
+        for bridge in bridge_names
+    )
+    xml = f"""<domain type='kvm'>
+  <name>{domain_name}</name>
+  <uuid>{domain_uuid}</uuid>
+  <metadata>
+    <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+      <libosinfo:os id="http://libosinfo.org/linux/2020"/>
+    </libosinfo:libosinfo>
+  </metadata>
+  <memory>{memory_kb}</memory>
+  <currentMemory>{memory_kb}</currentMemory>
+  <vcpu>{vcpus}</vcpu>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-passthrough'/>
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>/usr/libexec/qemu-kvm</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{disk_path}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    {interface_blocks}
+    <console type='pty'/>
+    <channel type='unix'>
+      <source mode='bind' path='/var/lib/libvirt/qemu/org.qemu.guest_agent.0'/>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <memballoon model='none'/>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>"""
+    return xml
+
+
+def start_systemd_unit(unit_name: str, mode: str = "replace"):
+    """Start a systemd unit via D-Bus.
+
+    Args:
+        unit_name (str): The name of the systemd unit.
+        mode (str): The start mode, default is "replace".
+    """
+    bus = dbus.SystemBus()
+    systemd_obj = bus.get_object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
+    systemd_mgr = dbus.Interface(systemd_obj, "org.freedesktop.systemd1.Manager")
+    systemd_mgr.StartUnit(unit_name, mode)
+
+
+def main():
+    """Main entry point for CHR Router domain setup."""
+    conn = libvirt.open("qemu:///system")
+    try:
+        # Remove all existing domains
+        for domain_id in conn.listDomainsID():
+            domain = conn.lookupByID(domain_id)
+            domain.destroy()
+        for domain_name in conn.listDefinedDomains():
+            domain = conn.lookupByName(domain_name)
+            domain.undefine()
+
+        vcpus = conn.getMaxVcpus(None)
+        memory_stats = conn.getMemoryStats(libvirt.VIR_NODE_MEMORY_STATS_ALL_CELLS)
+        available_memory_kb = max(memory_stats["total"] - RESERVED_MEMORY_KB, MIN_MEMORY_KB)
+
+        disk_path = create_vm_disk(CHR_IMAGE_SRC, CHR_IMAGE_DEST)
+        bridge_names = configure_network_bridges()
+        domain_xml = build_domain_xml(
+            vcpus, available_memory_kb, disk_path, bridge_names, str(uuid.uuid4()), CHR_VM_NAME
+        )
+        domain = conn.defineXML(domain_xml)
+        domain.create()
+        domain.setAutostart(1)
+    finally:
+        conn.close()
+
+    start_systemd_unit(POST_SYSTEMD_UNIT)
+
+
+if __name__ == "__main__":
+    main()

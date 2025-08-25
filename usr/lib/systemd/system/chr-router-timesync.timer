@@ -1,0 +1,10 @@
+[Unit]
+Description=CHR Router Time Sync Helper
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+Unit=chr-router-timesync.service
+
+[Install]
+WantedBy=multi-user.target

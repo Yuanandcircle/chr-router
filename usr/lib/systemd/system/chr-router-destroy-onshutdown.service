@@ -1,0 +1,15 @@
+[Unit]
+Description=CHR Router Destroy On Shutdown Helper
+ConditionPathExists=/etc/libvirt/qemu/routeros.xml
+After=libvirt-guests.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/libexec/chr-router-destroy-onshutdown
+User=root
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

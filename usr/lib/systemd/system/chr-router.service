@@ -1,0 +1,16 @@
+[Unit]
+Description=CHR Router
+ConditionPathExists=!/etc/libvirt/qemu/routeros.xml
+After=network-online.target
+After=libvirtd.socket
+After=virtqemud.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/chr-router
+User=root
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

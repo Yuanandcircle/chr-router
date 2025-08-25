@@ -1,0 +1,23 @@
+name: Build
+
+on:
+  push:
+    paths-ignore:
+      - '.github/**'
+      - 'README.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/yuanandcircle/chr-router:latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build container image
+        run: |
+          sudo podman build --tag ${{ env.IMAGE }} .

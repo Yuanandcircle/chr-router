@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""CHR Router Time Synchronization Utility.
+
+Synchronizes the Linux host's system time with the CHR Router VM's time,
+using libvirt Python bindings and sets system time via clock_settime from librt.
+The system time is set in UTC and is independent of the host's time zone configuration.
+"""
+
+import datetime
+import json
+import base64
+import libvirt
+import libvirt_qemu
+import ctypes
+import ctypes.util
+
+CHR_VM_NAME = "routeros"
+CLOCK_REALTIME = 0  # Constant required by clock_settime
+
+
+class TimeSpec(ctypes.Structure):
+    """ctypes structure for timespec, used by clock_settime."""
+
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
+def send_qemu_agent_command(domain, command: dict) -> dict:
+    """
+    Send a QEMU agent command to a libvirt domain and return the decoded JSON result.
+
+    Args:
+        domain (libvirt.virDomain): The VM domain object.
+        command (dict): The QEMU agent command as a dictionary.
+
+    Returns:
+        dict: The JSON-decoded response from the QEMU agent.
+    """
+    response = libvirt_qemu.qemuAgentCommand(
+        domain,
+        json.dumps(command),
+        5 * 1000,
+        0,
+    )
+    return json.loads(response)
+
+
+def get_router_clock_field(domain, field: str) -> str:
+    """
+    Query a specific clock field from the CHR Router VM via QEMU agent.
+
+    Args:
+        domain (libvirt.virDomain): The VM domain object.
+        field (str): The clock field to query (e.g. "date", "time", "gmt-offset").
+
+    Returns:
+        str: The field value as a string.
+    """
+    router_command = f":put [/system clock get {field}]"
+    guest_exec_command = {
+        "execute": "guest-exec",
+        "arguments": {
+            "input-data": base64.b64encode(router_command.encode("utf-8")).decode("utf-8"),
+            "capture-output": True,
+        },
+    }
+    exec_result = send_qemu_agent_command(domain, guest_exec_command)
+    pid = exec_result["return"]["pid"]
+    exec_status_command = {
+        "execute": "guest-exec-status",
+        "arguments": {"pid": pid},
+    }
+    exec_status_result = send_qemu_agent_command(domain, exec_status_command)
+    output_data = exec_status_result["return"]["out-data"]
+    return base64.b64decode(output_data).decode("utf-8").strip()
+
+
+def set_host_system_time_utc(dt: datetime.datetime):
+    """
+    Set the host's system time in UTC using clock_settime from librt.
+
+    Args:
+        dt (datetime.datetime): The desired datetime (will be converted to UTC).
+
+    Raises:
+        PermissionError: If failed to set system time (likely due to insufficient privileges).
+        RuntimeError: If librt library cannot be found.
+    """
+    dt_utc = dt.astimezone(datetime.timezone.utc)
+    ts = TimeSpec()
+    ts.tv_sec = int(dt_utc.timestamp())
+    ts.tv_nsec = int(dt_utc.microsecond * 1000)
+    librt_path = ctypes.util.find_library("rt")
+    if librt_path is None:
+        raise RuntimeError("Cannot find librt library (needed for clock_settime).")
+    librt = ctypes.CDLL(librt_path)
+    result = librt.clock_settime(CLOCK_REALTIME, ctypes.byref(ts))
+    if result != 0:
+        raise PermissionError("Failed to set system time. Root privileges required.")
+
+
+def main():
+    """
+    Main routine: synchronize host time with CHR Router's time.
+    """
+    # Connect to libvirt and locate the VM
+    conn = libvirt.open("qemu:///system")
+    if conn is None:
+        raise RuntimeError("Failed to open libvirt connection to qemu:///system.")
+    domain = conn.lookupByName(CHR_VM_NAME)
+    if domain is None:
+        conn.close()
+        raise RuntimeError(f"Failed to find domain '{CHR_VM_NAME}'.")
+
+    # Retrieve router's time info via QEMU agent
+    gmt_offset = int(get_router_clock_field(domain, "gmt-offset"))
+    tzinfo = datetime.timezone(datetime.timedelta(seconds=gmt_offset))
+    router_date = datetime.date.fromisoformat(get_router_clock_field(domain, "date"))
+    router_time = datetime.time.fromisoformat(get_router_clock_field(domain, "time"))
+    router_datetime = datetime.datetime.combine(router_date, router_time, tzinfo=tzinfo)
+    set_host_system_time_utc(router_datetime)
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

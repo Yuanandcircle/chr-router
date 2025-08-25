@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""CHR Router Destroy On Shutdown Helper.
+
+Destroys the CHR Router domain on system shutdown.
+"""
+
+import libvirt
+
+CHR_VM_NAME = "routeros"
+
+
+def main() -> None:
+    """Main entry point for destroying CHR Router domain."""
+    conn = libvirt.open("qemu:///system")
+    try:
+        domain = conn.lookupByName(CHR_VM_NAME)
+        domain.destroy()
+    except libvirt.libvirtError:
+        # Domain may not exist, ignore error
+        pass
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

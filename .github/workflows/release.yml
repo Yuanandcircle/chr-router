@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  IMAGE: ghcr.io/yuanandcircle/chr-router:latest
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build container image
+        run: |
+          sudo podman build --tag ${{ env.IMAGE }} .
+
+      - name: Build anaconda iso
+        run: |
+          mkdir -p output
+          sudo podman run --rm --privileged --security-opt label=type:unconfined_t \
+            -v ./output:/output \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type anaconda-iso --use-librepo=False --chown $(id -u):$(id -g) \
+            ${{ env.IMAGE }}
+
+      - name: Split large files in output (>2G)
+        run: |
+          find output -type f -size +2G | while read file; do
+            zip -s 2000m "$file.zip" "$file"
+            rm "$file"
+          done
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: output/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

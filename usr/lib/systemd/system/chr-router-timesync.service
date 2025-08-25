@@ -1,0 +1,13 @@
+[Unit]
+Description=CHR Router Time Sync Helper
+ConditionPathExists=/etc/libvirt/qemu/routeros.xml
+After=network-online.target
+After=libvirtd.socket
+After=virtqemud.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/chr-router-timesync
+User=root
+Restart=no
